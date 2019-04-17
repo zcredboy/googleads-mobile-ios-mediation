@@ -5,6 +5,17 @@
 #import "GADMAdapterAdColonyInitializer.h"
 #import "GADMAdapterAdColonyHelper.h"
 
+@interface GADMAdapterAdColonyInitializer ()
+
+@property NSSet *configuredZones;
+@property NSMutableSet *zonesToBeConfigured;
+@property AdColonyAdapterInitState adColonyAdapterInitState;
+@property NSArray *callbacks;
+@property BOOL hasNewZones;
+@property BOOL calledConfigureInLastFiveSeconds;
+
+@end
+
 @implementation GADMAdapterAdColonyInitializer
 
 + (instancetype)sharedInstance {
@@ -18,8 +29,10 @@
 
 - (id)init {
   if (self = [super init]) {
-    _zones = [NSSet set];
+    _configuredZones = [NSSet set];
+    _zonesToBeConfigured = [NSMutableSet set];
     _callbacks = [NSArray array];
+    _adColonyAdapterInitState = INIT_STATE_UNINITIALIZED;
   }
   return self;
 }
@@ -29,66 +42,99 @@
                             options:(AdColonyAppOptions *)options
                            callback:(void (^)(NSError *))callback {
   @synchronized(self) {
-    NSLogDebug(@"new zones: %@", newZones);
-    NSLogDebug(@"old zones: %@", self.zones);
-
-    // Even if ADC configure should be smart with configuring with superset/subset of zones, manage
-    // it here too.
-    NSSet *oldZones = [NSSet setWithSet:self.zones];
-    self.zones = [self.zones setByAddingObjectsFromArray:newZones];
-    if (![oldZones isEqualToSet:self.zones]) {
-      self.adColonyAdapterInitState = INIT_STATE_UNINITIALIZED;
-    }
-
-    // If ADC options have already been set, used directly or from previous configure here, use it
-    // Only build new options if not previously set.
-    if (options && self.adColonyAdapterInitState == INIT_STATE_INITIALIZED) {
-      [AdColony setAppOptions:options];
-    }
-
-    if (self.adColonyAdapterInitState == INIT_STATE_INITIALIZED) {
-      if (callback) {
-        callback(nil);
-      }
-    } else {
+    if (self.adColonyAdapterInitState == INIT_STATE_INITIALIZING) {
       if (callback) {
         self.callbacks = [self.callbacks arrayByAddingObject:callback];
       }
+      return;
+    }
 
-      // Don't allow multiple config requests, the 2nd will use the results of the previous.
-      if (self.adColonyAdapterInitState == INIT_STATE_UNINITIALIZED) {
-        self.adColonyAdapterInitState = INIT_STATE_INITIALIZING;
-        __weak typeof(self) weakSelf = self;
-        NSLogDebug(@"zones: %@", [self.zones allObjects]);
-        [AdColony configureWithAppID:appId
-                             zoneIDs:[self.zones allObjects]
-                             options:options
-                          completion:^(NSArray<AdColonyZone *> *_Nonnull zones) {
-                            __strong typeof(weakSelf) strongSelf = weakSelf;
-                            @synchronized(strongSelf) {
-                              if (zones.count < 1) {
-                                strongSelf.adColonyAdapterInitState = INIT_STATE_UNINITIALIZED;
-                                NSError *error =
-                                    [NSError errorWithDomain:@"GADMAdapterAdColonyInitializer"
-                                                        code:0
-                                                    userInfo:@{
-                                                      NSLocalizedDescriptionKey :
-                                                          @"Failed to configure the zoneID."
-                                                    }];
-                                for (void (^localCallback)() in strongSelf.callbacks) {
-                                  localCallback(error);
-                                }
-                              }
-                              strongSelf.adColonyAdapterInitState = INIT_STATE_INITIALIZED;
-                              for (void (^localCallback)() in strongSelf.callbacks) {
-                                localCallback(nil);
-                              }
-                              strongSelf.callbacks = [NSArray array];
-                            }
-                          }];
+    NSSet *newZonesSet;
+    if (newZones) {
+      newZonesSet = [NSSet setWithArray:newZones];
+    }
+
+    _hasNewZones = ![newZonesSet isSubsetOfSet:_configuredZones];
+
+    if (_hasNewZones) {
+      [_zonesToBeConfigured setByAddingObjectsFromSet:newZonesSet];
+      if (_calledConfigureInLastFiveSeconds) {
+        NSError *error = [NSError
+            errorWithDomain:@"GADMAdapterAdColonyInitializer"
+                       code:0
+                   userInfo:@{
+                     NSLocalizedDescriptionKey : @"Can't configure a zone within five seconds."
+                   }];
+        callback(error);
+        return;
+      } else {
+        _adColonyAdapterInitState = INIT_STATE_INITIALIZING;
+        [self configureWithAppID:appId zoneIDs:[_zonesToBeConfigured allObjects] options:options];
+        [_zonesToBeConfigured removeAllObjects];
+      }
+
+    } else {
+      if (options) {
+        [AdColony setAppOptions:options];
+      }
+
+      if (_adColonyAdapterInitState == INIT_STATE_INITIALIZED) {
+        if (callback) {
+          callback(nil);
+        }
+      } else if (_adColonyAdapterInitState == INIT_STATE_INITIALIZING) {
+        if (callback) {
+          [_callbacks arrayByAddingObject:callback];
+        }
       }
     }
   }
+}
+
+- (void)configureWithAppID:(NSString *)appID
+                   zoneIDs:(NSArray *)zoneIDs
+                   options:(AdColonyAppOptions *)options {
+  GADMAdapterAdColonyInitializer *__weak weakSelf = self;
+
+  NSLogDebug(@"zones: %@", [self.zones allObjects]);
+  _calledConfigureInLastFiveSeconds = YES;
+  [AdColony
+      configureWithAppID:appID
+                 zoneIDs:zoneIDs
+                 options:options
+              completion:^(NSArray<AdColonyZone *> *_Nonnull zones) {
+                GADMAdapterAdColonyInitializer *strongSelf = weakSelf;
+                @synchronized(strongSelf) {
+                  if (zones.count < 1) {
+                    strongSelf.adColonyAdapterInitState = INIT_STATE_UNINITIALIZED;
+                    NSError *error = [NSError
+                        errorWithDomain:@"GADMAdapterAdColonyInitializer"
+                                   code:0
+                               userInfo:@{
+                                 NSLocalizedDescriptionKey : @"Failed to configure the zoneID."
+                               }];
+                    for (void (^localCallback)() in strongSelf.callbacks) {
+                      localCallback(error);
+                    }
+                  }
+
+                  strongSelf.adColonyAdapterInitState = INIT_STATE_INITIALIZED;
+                  for (void (^localCallback)() in strongSelf.callbacks) {
+                    localCallback(nil);
+                  }
+                  strongSelf.callbacks = [NSArray array];
+                }
+              }];
+
+  [NSTimer scheduledTimerWithTimeInterval:5.0
+                                   target:self
+                                 selector:@selector(changeCalledConfigureInLastFiveSeconds:)
+                                 userInfo:nil
+                                  repeats:NO];
+}
+
+- (void)changeCalledConfigureInLastFiveSeconds {
+  _calledConfigureInLastFiveSeconds = NO;
 }
 
 @end
